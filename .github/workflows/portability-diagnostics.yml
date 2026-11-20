@@ -13,8 +13,6 @@ jobs:
     timeout-minutes: 90
     env:
       QT_QPA_PLATFORM: cocoa
-      UV_TEST: src/app/tests/cleave_input_routing_tests.cpp
-      BASE: a43db13b1dacd95522d8aec081f23ef7b679c730
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -54,33 +52,46 @@ jobs:
               }"""
           p.write_text("#include <cstdio>\n" + s.replace(anchor, anchor + diagnostic))
           PY
-      - name: Build stable cursor fixture
+      - name: Record anchor and frame geometry without changing placement
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src/app/src/ui/components/dialog_window_policy.hpp")
+          s = p.read_text()
+          anchor = "    const QPoint measuredTopLeft = dialog.frameGeometry().topLeft();"
+          assert s.count(anchor) == 1
+          probe = """
+              std::fprintf(stderr, "CAPTION-BEFORE-SHOW anchor=%d,%d,%dx%d client=%dx%d requestedSize=%dx%d requestedPos=%d,%d frame=%d,%d,%dx%d available=%d,%d,%dx%d margins=%d,%d,%d,%d\\n",
+                  anchorGlobalRect.x(), anchorGlobalRect.y(), anchorGlobalRect.width(), anchorGlobalRect.height(),
+                  dialog.width(), dialog.height(), frameSize.width(), frameSize.height(), target.x(), target.y(),
+                  dialog.frameGeometry().x(), dialog.frameGeometry().y(), dialog.frameGeometry().width(), dialog.frameGeometry().height(),
+                  screen->availableGeometry().x(), screen->availableGeometry().y(), screen->availableGeometry().width(), screen->availableGeometry().height(),
+                  frameMargins.left(), frameMargins.top(), frameMargins.right(), frameMargins.bottom());"""
+          p.write_text("#include <cstdio>\n" + s.replace(anchor, anchor + probe))
+          p = Path("src/app/tests/parameter_helper_dialog_tests.cpp")
+          s = p.read_text()
+          anchor = "            const QRect dialogGlobal = dialog->frameGeometry();"
+          assert s.count(anchor) == 1
+          probe = """
+                      std::fprintf(stderr, "CAPTION-AFTER-SHOW anchor=%d,%d,%dx%d frame=%d,%d,%dx%d shownClient=%dx%d min=%d caption=%d\\n",
+                          anchorGlobal.x(), anchorGlobal.y(), anchorGlobal.width(), anchorGlobal.height(),
+                          dialogGlobal.x(), dialogGlobal.y(), dialogGlobal.width(), dialogGlobal.height(), dialog->width(), dialog->height(),
+                          dialog->minimumWidth(), ui::minimumDialogWidthForCaption(*dialog));"""
+          p.write_text("#include <cstdio>\n" + s.replace(anchor, anchor + probe))
+          PY
+      - name: Build the focused native test target
         run: |
           set -euo pipefail
-          cp "$UV_TEST" "$RUNNER_TEMP/candidate-uv.cpp"
-          git show "$BASE:$UV_TEST" > "$UV_TEST"
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSED_CPP_STANDARD=23 \
             -DSED_QT_ROOT="$QT_ROOT_DIR" -DSED_BUILD_UPDATE=OFF -DSED_BUILD_PLUGIN_BRIDGE=OFF \
             -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
           cmake --build build --parallel 3 --target sed_app_main_window_tests
-      - name: Record native stable cursor results
-        continue-on-error: true
+      - name: Verify cursor, shape and reactivated input-dialog layout
         run: |
           set -euo pipefail
           ctest --test-dir build --output-on-failure --no-tests=error --parallel 1 \
-            -R '^sed_app_cleave_(input_routing|fly_custom_shortcuts|uv_custom_owner)$' \
-            --output-junit "$RUNNER_TEMP/cocoa/stable-uv.xml" 2>&1 | tee "$RUNNER_TEMP/cocoa/stable-uv.log"
-      - name: Relink only the candidate cursor fixture
-        run: |
-          set -euo pipefail
-          cp "$RUNNER_TEMP/candidate-uv.cpp" "$UV_TEST"
-          cmake --build build --parallel 3 --target sed_app_main_window_tests
-      - name: Run candidate cursor, shape, caption, wire and lighting selectors
-        run: |
-          set -euo pipefail
-          ctest --test-dir build --output-on-failure --no-tests=error --parallel 1 \
-            -R '^sed_app_(cleave_(input_routing|fly_custom_shortcuts|uv_custom_owner|shape_apply)|parameter_helper_dialogs|wireframe_support_depth|mots_arch_lighting)$' \
-            --output-junit "$RUNNER_TEMP/cocoa/candidate.xml" 2>&1 | tee "$RUNNER_TEMP/cocoa/candidate.log"
+            -R '^sed_app_(cleave_(input_routing|fly_custom_shortcuts|uv_custom_owner|shape_apply)|parameter_helper_dialogs)$' \
+            --output-junit "$RUNNER_TEMP/cocoa/combined.xml" 2>&1 | tee "$RUNNER_TEMP/cocoa/combined.log"
       - name: Preserve focused readback
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

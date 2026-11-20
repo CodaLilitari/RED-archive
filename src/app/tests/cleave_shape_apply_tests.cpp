@@ -20,6 +20,7 @@
 #include <QSpinBox>
 #include <QToolButton>
 #include <QWidget>
+#include <QtCore/qtestsupport_core.h>
 
 #include <algorithm>
 #include <array>
@@ -377,6 +378,18 @@ bool polygonsHavePositiveAreaOverlap(const Polygon2& first, const Polygon2& seco
         && std::abs(signedArea(intersection)) > 1.0e-8;
 }
 
+void showShapeFixtureWindow(MainWindow& window)
+{
+    window.show();
+    window.activateWindow();
+    QApplication::setActiveWindow(&window);
+    QApplication::processEvents(QEventLoop::AllEvents);
+    // Loading the level schedules a top-down refit after the dock layout settles.
+    // Install the wall-facing camera only after that refit has run.
+    check(QTest::qWaitFor([&window] { return !window.pendingEditorViewRefitForTest(); }, 2000),
+        "the startup viewport refit finishes before setting the shape fixture camera");
+}
+
 bool configureSurfaceWindow(MainWindow& window)
 {
     window.setAttribute(Qt::WA_DontShowOnScreen);
@@ -387,10 +400,7 @@ bool configureSurfaceWindow(MainWindow& window)
     window.activateSurfaceEditModeForTest();
     window.activateSurfaceFaceSubModeForTest();
     window.setLayerVisualStateForTest({ true }, { false });
-    window.show();
-    window.activateWindow();
-    QApplication::setActiveWindow(&window);
-    QApplication::processEvents(QEventLoop::AllEvents);
+    showShapeFixtureWindow(window);
 
     GlView* const view = window.glViewForTest();
     QAction* const cleaveAction = window.findChild<QAction*>(
@@ -471,10 +481,7 @@ bool configureSectorWindow(MainWindow& window)
     window.setDocumentStateForTest(makeWallState(false));
     window.activateSectorEditModeForTest();
     window.setLayerVisualStateForTest({ true }, { false });
-    window.show();
-    window.activateWindow();
-    QApplication::setActiveWindow(&window);
-    QApplication::processEvents(QEventLoop::AllEvents);
+    showShapeFixtureWindow(window);
 
     GlView* const view = window.glViewForTest();
     QAction* const cleaveAction = window.findChild<QAction*>(
