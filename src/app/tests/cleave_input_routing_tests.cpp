@@ -24,6 +24,7 @@
 #include <QSettings>
 #include <QTemporaryDir>
 #include <QWheelEvent>
+#include <QtCore/qtestsupport_core.h>
 
 #ifdef Q_OS_WIN
 #  include <QtCore/qt_windows.h>
@@ -47,6 +48,15 @@ QPoint visiblePointerCenter(const QWidget& target)
     const QRect bounds(target.mapToGlobal(QPoint{}), target.size());
     const QRect visible = bounds.intersected(target.screen()->geometry());
     return visible.isEmpty() ? target.rect().center() : target.mapFromGlobal(visible.center());
+}
+
+void movePointerForUvKey(const QPoint& requested)
+{
+    // Cocoa posts a native mouse event. Wait for the real cursor before sending
+    // a key whose owner is selected from its global position.
+    QCursor::setPos(requested);
+    check(QTest::qWaitFor([requested] { return QCursor::pos() == requested; }, 1000),
+        "the native cursor reaches the requested position before UV key dispatch");
 }
 
 void focus(QWidget& target)
@@ -961,7 +971,7 @@ void testUvPointerShortcutOwnership()
         focus(*view);
         view->setFocus(Qt::OtherFocusReason);
         const QPoint canvasCenter = canvas->mapToGlobal(visiblePointerCenter(*canvas));
-        QCursor::setPos(canvasCenter);
+        movePointerForUvKey(canvasCenter);
         QKeyEvent overrideEvent(QEvent::ShortcutOverride, code, Qt::NoModifier);
         overrideEvent.setAccepted(false);
         if ( !requireCanvasPointer("before ShortcutOverride", code, canvasCenter) )
@@ -1366,7 +1376,7 @@ void testCustomCleaveKeysRespectUvCommands()
         const QPoint center = visiblePointerCenter(*canvas);
         mouse(*canvas, QEvent::MouseMove, center);
         focus(*view);
-        QCursor::setPos(canvas->mapToGlobal(center));
+        movePointerForUvKey(canvas->mapToGlobal(center));
         if (command != Qt::Key_A)
         {
             key(*view, Qt::Key_G);
@@ -1379,7 +1389,7 @@ void testCustomCleaveKeysRespectUvCommands()
         {
             view->setFocus(Qt::OtherFocusReason);
         }
-        QCursor::setPos(canvas->mapToGlobal(center));
+        movePointerForUvKey(canvas->mapToGlobal(center));
         if (command != Qt::Key_A)
         {
             check(window.uvEditorStoredPointsForTest({0, 0}) == preview && preview != before,
