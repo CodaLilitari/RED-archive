@@ -1,41 +1,90 @@
-name: Floating-point portability diagnostics
+name: Focused macOS native qualification
 
 on:
-  push:
-    branches: ["codex/red-unified-release"]
-    paths:
-      - "src/core/**"
-      - ".github/workflows/portability-diagnostics.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: portability-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  macos-core:
-    name: macOS core (${{ matrix.contraction }})
+  cocoa:
+    if: github.ref == 'refs/heads/ci/0.8.0-macos-native-followup'
     runs-on: macos-15
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        contraction: [default, off]
+    timeout-minutes: 90
+    env:
+      QT_QPA_PLATFORM: cocoa
+      UV_TEST: src/app/tests/cleave_input_routing_tests.cpp
+      BASE: a43db13b1dacd95522d8aec081f23ef7b679c730
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Configure isolated core diagnostic
-        shell: bash
-        env:
-          CONTRACTION: ${{ matrix.contraction }}
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Install Ninja
+        run: brew install ninja
+      - name: Install Qt
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06
+        with:
+          version: '6.8.3'
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia
+          aqtversion: ==3.3.0
+          py7zrversion: ==1.1.0
+      - name: Prepare native desktop and shared renderer readback
         run: |
-          flags=""
-          if [[ "$CONTRACTION" == "off" ]]; then flags="-ffp-contract=off"; fi
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DSED_CPP_STANDARD=23 -DSED_BUILD_APP=OFF -DCMAKE_CXX_FLAGS="$flags"
-      - name: Build exact core tests
-        run: cmake --build build --target sed_core_tests --parallel 3
-      - name: Test without assertion or tolerance changes
-        run: ctest --test-dir build --output-on-failure -R '^sed_core_tests$'
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cocoa"
+          xcrun swift tools/release/prepare_macos_test_display.swift | tee "$RUNNER_TEMP/cocoa/display.log"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src/app/src/render/gl_view_render.cpp")
+          s = p.read_text()
+          anchor = "    QOpenGLContext* activeContext = QOpenGLContext::currentContext();"
+          assert s.count(anchor) == 1
+          diagnostic = """
+              static bool recorded = false;
+              if (activeContext && !recorded) {
+                  recorded = true;
+                  auto *gl = activeContext->extraFunctions();
+                  auto info = [gl](GLenum name) { return reinterpret_cast<const char*>(gl->glGetString(name)); };
+                  std::fprintf(stderr, "COCOA-CONTEXT: GL=%s; GLSL=%s; renderer=%s; vendor=%s\\n",
+                      info(GL_VERSION), info(GL_SHADING_LANGUAGE_VERSION), info(GL_RENDERER), info(GL_VENDOR));
+              }"""
+          p.write_text("#include <cstdio>\n" + s.replace(anchor, anchor + diagnostic))
+          PY
+      - name: Build stable cursor fixture
+        run: |
+          set -euo pipefail
+          cp "$UV_TEST" "$RUNNER_TEMP/candidate-uv.cpp"
+          git show "$BASE:$UV_TEST" > "$UV_TEST"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSED_CPP_STANDARD=23 \
+            -DSED_QT_ROOT="$QT_ROOT_DIR" -DSED_BUILD_UPDATE=OFF -DSED_BUILD_PLUGIN_BRIDGE=OFF \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
+          cmake --build build --parallel 3 --target sed_app_main_window_tests
+      - name: Record native stable cursor results
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure --no-tests=error --parallel 1 \
+            -R '^sed_app_cleave_(input_routing|fly_custom_shortcuts|uv_custom_owner)$' \
+            --output-junit "$RUNNER_TEMP/cocoa/stable-uv.xml" 2>&1 | tee "$RUNNER_TEMP/cocoa/stable-uv.log"
+      - name: Relink only the candidate cursor fixture
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/candidate-uv.cpp" "$UV_TEST"
+          cmake --build build --parallel 3 --target sed_app_main_window_tests
+      - name: Run candidate cursor, shape, caption, wire and lighting selectors
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure --no-tests=error --parallel 1 \
+            -R '^sed_app_(cleave_(input_routing|fly_custom_shortcuts|uv_custom_owner|shape_apply)|parameter_helper_dialogs|wireframe_support_depth|mots_arch_lighting)$' \
+            --output-junit "$RUNNER_TEMP/cocoa/candidate.xml" 2>&1 | tee "$RUNNER_TEMP/cocoa/candidate.log"
+      - name: Preserve focused readback
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-cocoa-followup
+          path: ${{ runner.temp }}/cocoa/
+          retention-days: 14
