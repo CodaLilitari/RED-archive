@@ -1,258 +1,160 @@
-name: Windows native release qualification
+name: Windows native OpenGL 3.3 qualification
 on:
   push:
     branches: ["ci/0.8.0-windows-display-probe"]
 permissions:
   contents: read
 jobs:
-  windows:
-    name: Complete frozen Windows release on native 1080p desktop
+  gl:
     runs-on: windows-latest
-    timeout-minutes: 150
+    timeout-minutes: 18
+    env:
+      QT_OPENGL: software
+      QT_FORCE_STDERR_LOGGING: "1"
+      QT_LOGGING_RULES: qt.qpa.gl.debug=true
     steps:
       - uses: actions/checkout@v4
         with:
           ref: cb449b6820d37b245f5c8f8c7989c897e7ee5d79
           persist-credentials: false
-      - name: Record and verify source revision
-        shell: pwsh
-        run: |
-          $revision = git rev-parse HEAD
-          Write-Host "Frozen RED source $revision"
-          if ($revision -ne 'cb449b6820d37b245f5c8f8c7989c897e7ee5d79') { throw 'Unexpected source revision' }
-      - name: Qualify native 1920×1080 on the hosted desktop
-        shell: python {0}
-        run: |
-          import ctypes as c
-          import json
-          import os
-          import subprocess
-          import sys
-          import time
-          from ctypes import wintypes as w
-
-          user = c.WinDLL("user32", use_last_error=True)
-          kernel = c.WinDLL("kernel32", use_last_error=True)
-
-
-          def bind(dll, name, restype, argtypes):
-              function = getattr(dll, name)
-              function.argtypes = argtypes
-              function.restype = restype
-              return function
-
-
-          def log(kind, **values):
-              print(kind, json.dumps(values, sort_keys=True), flush=True)
-
-
-          class Mode(c.Structure):
-              _fields_ = [
-                  ("device", w.WCHAR * 32), ("spec", w.WORD), ("driver", w.WORD),
-                  ("size", w.WORD), ("extra", w.WORD), ("fields", w.DWORD),
-                  ("x", w.LONG), ("y", w.LONG), ("orientation", w.DWORD), ("fixed", w.DWORD),
-                  ("color", w.SHORT), ("duplex", w.SHORT), ("yres", w.SHORT),
-                  ("tt", w.SHORT), ("collate", w.SHORT), ("form", w.WCHAR * 32),
-                  ("logpix", w.WORD), ("bpp", w.DWORD), ("width", w.DWORD),
-                  ("height", w.DWORD), ("flags", w.DWORD), ("hz", w.DWORD),
-                  ("icm_method", w.DWORD), ("icm_intent", w.DWORD), ("media", w.DWORD),
-                  ("dither", w.DWORD), ("reserved1", w.DWORD), ("reserved2", w.DWORD),
-                  ("pan_width", w.DWORD), ("pan_height", w.DWORD),
-              ]
-
-
-          assert c.sizeof(Mode) == 220
-          get_mode = bind(user, "EnumDisplaySettingsExW", w.BOOL, [w.LPCWSTR, w.DWORD, c.POINTER(Mode), w.DWORD])
-          change = bind(user, "ChangeDisplaySettingsExW", w.LONG, [w.LPCWSTR, c.POINTER(Mode), w.HWND, w.DWORD, w.LPVOID])
-          get_station = bind(user, "GetProcessWindowStation", w.HANDLE, [])
-          get_desktop = bind(user, "GetThreadDesktop", w.HANDLE, [w.DWORD])
-          input_desktop = bind(user, "OpenInputDesktop", w.HANDLE, [w.DWORD, w.BOOL, w.DWORD])
-          close_desktop = bind(user, "CloseDesktop", w.BOOL, [w.HANDLE])
-          get_name = bind(user, "GetUserObjectInformationW", w.BOOL, [w.HANDLE, w.INT, w.LPVOID, w.DWORD, c.POINTER(w.DWORD)])
-          get_ancestor = bind(user, "GetAncestor", w.HWND, [w.HWND, w.UINT])
-          get_foreground = bind(user, "GetForegroundWindow", w.HWND, [])
-          set_foreground = bind(user, "SetForegroundWindow", w.BOOL, [w.HWND])
-          get_cursor = bind(user, "GetCursorPos", w.BOOL, [c.POINTER(w.POINT)])
-          set_cursor = bind(user, "SetCursorPos", w.BOOL, [w.INT, w.INT])
-          client_to_screen = bind(user, "ClientToScreen", w.BOOL, [w.HWND, c.POINTER(w.POINT)])
-          window_from_point = bind(user, "WindowFromPoint", w.HWND, [w.POINT])
-          mouse_event = bind(user, "mouse_event", None, [w.DWORD, w.DWORD, w.DWORD, w.DWORD, c.c_size_t])
-          wts = bind(kernel, "WTSGetActiveConsoleSessionId", w.DWORD, [])
-          process_session = bind(kernel, "ProcessIdToSessionId", w.BOOL, [w.DWORD, c.POINTER(w.DWORD)])
-          thread_id = bind(kernel, "GetCurrentThreadId", w.DWORD, [])
-          bind(user, "SetProcessDpiAwarenessContext", w.BOOL, [w.HANDLE])(c.c_void_p(-4))
-
-
-          def named(handle):
-              data = c.create_unicode_buffer(256)
-              size = w.DWORD()
-              if not handle or not get_name(handle, 2, data, c.sizeof(data), c.byref(size)):
-                  return None
-              return data.value
-
-
-          def mode(index):
-              m = Mode()
-              m.size = c.sizeof(m)
-              return m if get_mode(None, index, c.byref(m), 0) else None
-
-
-          def dims(m):
-              return (m.width, m.height, m.bpp, m.hz)
-
-
-          def probe_window(label):
-              import tkinter as tk
-
-              root = tk.Tk()
-              root.title("RED disposable hosted input probe")
-              x = 1450 if label == "1920x1080" else 70
-              y = 710 if label == "1920x1080" else 80
-              root.geometry(f"320x180+{x}+{y}")
-              results = []
-              root.bind("<ButtonPress-1>", lambda e: results.append("press"))
-              root.bind("<ButtonRelease-1>", lambda e: results.append("release"))
-              def pump():
-                  for _ in range(12):
-                      root.update()
-                      time.sleep(0.025)
-              try:
-                  pump()
-                  client = root.winfo_id()
-                  target = get_ancestor(client, 2)
-                  initial_fg = get_foreground()
-                  accepted = bool(set_foreground(target))
-                  pump()
-                  foreground_match = target == get_foreground()
-                  p = w.POINT(70, 75)
-                  converted = bool(client_to_screen(client, c.byref(p)))
-                  moved = converted and bool(set_cursor(p.x, p.y))
-                  pump()
-                  actual = w.POINT()
-                  read = bool(get_cursor(c.byref(actual)))
-                  hit = window_from_point(actual) if read else None
-                  over_own = bool(hit and get_ancestor(hit, 2) == target)
-                  if over_own and moved:
-                      mouse_event(2, 0, 0, 0, 0)
-                      mouse_event(4, 0, 0, 0, 0)
-                      pump()
-                  rect = w.RECT()
-                  work_ok = user.SystemParametersInfoW(0x30, 0, c.byref(rect), 0)
-                  log("native-input", mode=label, target_created=bool(target), foreground_existed=bool(initial_fg),
-                      set_foreground=accepted, foreground_matched=foreground_match,
-                      cursor_set=moved, cursor_read=read, requested=[p.x, p.y], actual=[actual.x, actual.y],
-                      hit_own_window=over_own, received=results,
-                      tk_dimensions=[root.winfo_screenwidth(), root.winfo_screenheight()],
-                      monitor_dimensions=[user.GetSystemMetrics(0), user.GetSystemMetrics(1)],
-                      work_area=[rect.left, rect.top, rect.right, rect.bottom] if work_ok else None)
-                  if label == "1920x1080":
-                      if not (target and foreground_match and moved and read and over_own
-                              and actual.x == p.x and actual.y == p.y and actual.x > 1024
-                              and results == ["press", "release"]
-                              and root.winfo_screenwidth() == 1920 and root.winfo_screenheight() == 1080):
-                          raise RuntimeError("The fresh 1920x1080 process could not qualify real foreground and pointer delivery")
-              finally:
-                  root.destroy()
-
-
-          if len(sys.argv) == 3 and sys.argv[1] == "child":
-              probe_window(sys.argv[2])
-              sys.exit(0)
-
-
-          def fresh_probe(label):
-              subprocess.run([sys.executable, os.path.abspath(__file__), "child", label], check=True)
-
-
-          session = w.DWORD()
-          ok = bool(process_session(os.getpid(), c.byref(session)))
-          c.set_last_error(0)
-          desktop = input_desktop(0, 0, 1)
-          desktop_error = c.get_last_error() if not desktop else 0
-          log("desktop", process_session=session.value if ok else None, console_session=wts(),
-              window_station=named(get_station()), process_desktop=named(get_desktop(thread_id())),
-              input_desktop=named(desktop), open_input_error=desktop_error)
-          if desktop:
-              close_desktop(desktop)
-          original = mode(0xffffffff)
-          modes = []
-          while (m := mode(len(modes))) is not None:
-              modes.append(m)
-          log("display", current=dims(original) if original else None,
-              modes=sorted(set(dims(m) for m in modes)))
-          fresh_probe("original")
-          if original:
-              qualified = False
-              try:
-                  for width, height in ((1920,1080), (2560,1440)):
-                      offered = [m for m in modes if m.width == width and m.height == height and m.bpp == original.bpp]
-                      if not offered:
-                          log("mode-change", requested=[width,height], offered=False)
-                          continue
-                      chosen = min(offered, key=lambda m: abs(int(m.hz) - int(original.hz)))
-                      copy = Mode.from_buffer_copy(chosen)
-                      copy.fields = 0x40000 | 0x80000 | 0x100000 | 0x400000
-                      test = change(None, c.byref(copy), None, 2, None)
-                      applied = change(None, c.byref(copy), None, 0, None) if test == 0 else None
-                      time.sleep(1)
-                      current = mode(0xffffffff)
-                      log("mode-change", requested=[width,height], offered=True, cds_test=test, applied=applied,
-                          actual=dims(current) if current else None)
-                      if applied == 0 and current and (current.width,current.height) == (width,height):
-                          fresh_probe(str(width) + "x" + str(height))
-                          if (width,height) == (1920,1080):
-                              qualified = True
-                              break
-              finally:
-                  if not qualified:
-                      original.fields = 0x40000 | 0x80000 | 0x100000 | 0x400000
-                      restored = change(None, c.byref(original), None, 0, None)
-                      log("restore-after-failure", result=restored)
-              if not qualified:
-                  raise RuntimeError("1920x1080 was unavailable on this runner")
-          else:
-              raise RuntimeError("Could not read the runner display")
-      - name: Install Qt 6.8.3
-        uses: jurplel/install-qt-action@v4
+      - uses: jurplel/install-qt-action@v4
         with:
           version: "6.8.3"
           host: windows
           target: desktop
           arch: win64_msvc2022_64
           modules: qtmultimedia
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-      - name: Configure
-        run: cmake -S . -B build/full -G "Ninja Multi-Config" -DSED_CPP_STANDARD=23 -DSED_QT_ROOT="${{ env.QT_ROOT_DIR }}"
-      - name: Build
+      - name: Build frozen RED native depth fixture and independent context probe
         shell: pwsh
         run: |
-          $cores = [Environment]::ProcessorCount
-          $availableGiB = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
-          $jobs = [Math]::Max(1, [Math]::Min([Math]::Min(4, $cores), [int][Math]::Floor($availableGiB / 2.5)))
-          Write-Host "Logical CPUs $cores; available memory $availableGiB GiB; parallel build jobs $jobs"
-          cmake --build build/full --config Release --parallel $jobs
-      - name: Complete Windows Release CTest gate
-        timeout-minutes: 75
-        env:
-          QT_OPENGL: software
-          QT_QPA_PLATFORM_PLUGIN_PATH: ${{ env.QT_ROOT_DIR }}/plugins/platforms
+          $qt = $env:QT_ROOT_DIR
+          git rev-parse HEAD
+          cmake -S . -B build/gl -G "Ninja Multi-Config" -DSED_CPP_STANDARD=23 "-DSED_QT_ROOT=$qt"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build/gl --config Release --target sed_app_depth_snapshot_tests --parallel 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          @'
+          #define NOMINMAX
+          #include <windows.h>
+          #include <tlhelp32.h>
+          #include <QApplication>
+          #include <QOpenGLContext>
+          #include <QOpenGLFunctions>
+          #include <QOpenGLFunctions_3_3_Core>
+          #include <QOpenGLVersionFunctionsFactory>
+          #include <QOpenGLWidget>
+          #include <QThread>
+          #include <QElapsedTimer>
+          #include <cstdio>
+          #include <string>
+
+          void modules() {
+              HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+              MODULEENTRY32W m{};
+              m.dwSize = sizeof(m);
+              if (snapshot != INVALID_HANDLE_VALUE && Module32FirstW(snapshot, &m)) {
+                  do {
+                      const QString name = QString::fromWCharArray(m.szModule).toLower();
+                      if (name.contains("opengl") || name.contains("gallium") || name.contains("llvm")) {
+                          std::printf("Loaded module %s\n", QString::fromWCharArray(m.szExePath).toUtf8().constData());
+                      }
+                  } while (Module32NextW(snapshot, &m));
+              }
+              if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot);
+          }
+
+          int main(int argc, char** argv) {
+              const bool compatibility = argc >= 2 && std::string(argv[1]) == "--compat";
+              QSurfaceFormat requested;
+              requested.setVersion(compatibility ? 2 : 3, compatibility ? 0 : 3);
+              requested.setProfile(compatibility ? QSurfaceFormat::NoProfile : QSurfaceFormat::CoreProfile);
+              requested.setDepthBufferSize(24);
+              requested.setStencilBufferSize(8);
+              QSurfaceFormat::setDefaultFormat(requested);
+              QApplication app(argc, argv);
+              QOpenGLWidget widget;
+              widget.resize(320, 240);
+              widget.show();
+              QElapsedTimer wait;
+              wait.start();
+              do {
+                  app.processEvents();
+                  QThread::msleep(10);
+              } while (!widget.isValid() && wait.elapsed() < 4000);
+              std::printf("Qt %s requested %s; widget valid %d\n", qVersion(),
+                  compatibility ? "2.0" : "3.3 core, depth 24 stencil 8", int(widget.isValid()));
+              modules();
+              if (!widget.isValid() || !widget.context()) return 2;
+              widget.makeCurrent();
+              auto* context = widget.context();
+              const auto fmt = context->format();
+              auto* f = context->functions();
+              std::printf("Actual Qt format %d.%d profile %d depth %d stencil %d\n",
+                  fmt.majorVersion(), fmt.minorVersion(), int(fmt.profile()), fmt.depthBufferSize(), fmt.stencilBufferSize());
+              for (const auto key : { GL_VENDOR, GL_RENDERER, GL_VERSION, GL_SHADING_LANGUAGE_VERSION }) {
+                  const auto* value = f->glGetString(key);
+                  std::printf("GL %04x %s\n", key, value ? reinterpret_cast<const char*>(value) : "(null)");
+              }
+              auto* core = QOpenGLVersionFunctionsFactory::get<QOpenGLFunctions_3_3_Core>(context);
+              const bool coreWorks = core && core->initializeOpenGLFunctions();
+              const auto error = f->glGetError();
+              std::printf("3.3 core functions %d; GL error %04x\n", int(coreWorks), error);
+              return compatibility || (coreWorks && !error) ? 0 : 3;
+          }
+          '@ | Set-Content (Join-Path $env:RUNNER_TEMP probe.cpp) -Encoding utf8
+          $includes = 'QtCore', 'QtGui', 'QtWidgets', 'QtOpenGL', 'QtOpenGLWidgets' | ForEach-Object { "/I$qt/include/$_" }
+          cl.exe /nologo /EHsc /MD /std:c++17 "/I$qt/include" @includes "$env:RUNNER_TEMP/probe.cpp" "/Fo:$env:RUNNER_TEMP/probe.obj" "/Fe:$env:RUNNER_TEMP/probe.exe" /link "/LIBPATH:$qt/lib" Qt6Core.lib Qt6Gui.lib Qt6Widgets.lib Qt6OpenGL.lib Qt6OpenGLWidgets.lib
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          @'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT_DIR/plugins/platforms"
+          & "$env:RUNNER_TEMP/probe.exe" --compat
+          Write-Host "Compatibility-return=$LASTEXITCODE"
+          & "$env:RUNNER_TEMP/probe.exe"
+          $core = $LASTEXITCODE
+          ctest --test-dir build/gl -C Release -R '^sed_app_depth_snapshot$' --output-on-failure --no-tests=error
+          $depth = $LASTEXITCODE
+          Write-Host "Native-core-return=$core RED-depth-return=$depth"
+          if ($core -eq 0 -and $depth -eq 0) { exit 0 }
+          exit 1
+          '@ | Set-Content "$env:RUNNER_TEMP/test-gl.ps1" -Encoding utf8
+      - name: Test Qt stock loader and absolute kit path in fresh processes
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.Windows.Forms
-          $screen = [Windows.Forms.Screen]::PrimaryScreen
-          Write-Host "Pre-CTest native screen $($screen.Bounds); work area $($screen.WorkingArea)"
-          if ($screen.Bounds.Width -ne 1920 -or $screen.Bounds.Height -ne 1080) { throw 'Native full-HD mode no longer active' }
-          ctest --test-dir build/full -C Release --output-on-failure --no-tests=error --parallel 1 --output-junit windows-ctest.xml
-      - name: Upload Windows test diagnostics
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: windows-test-diagnostics-native-1080p-cb449b68
-          path: |
-            build/full/Testing/Temporary/
-            build/full/windows-ctest.xml
-          if-no-files-found: warn
-          retention-days: 14
+          $PSNativeCommandUseErrorActionPreference = $false
+          $kit = "$env:QT_ROOT_DIR/bin/opengl32sw.dll"
+          Get-FileHash $kit
+          Write-Host "Stock software loader"
+          pwsh -NoProfile -File "$env:RUNNER_TEMP/test-gl.ps1"
+          $bare = $LASTEXITCODE
+          $env:QT_OPENGL_DLL = $kit
+          Write-Host "Stock explicit library $kit"
+          pwsh -NoProfile -File "$env:RUNNER_TEMP/test-gl.ps1"
+          $absolute = $LASTEXITCODE
+          Write-Host "Bare return $bare. Absolute return $absolute."
+          if ($bare -eq 0 -or $absolute -eq 0) { "RED_STOCK_PASSED=1" >> $env:GITHUB_ENV }
+          exit 0
+      - name: Test pinned conda-forge Mesa llvmpipe in an isolated prefix
+        if: env.RED_STOCK_PASSED != '1'
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP red-mesa
+          $env:CONDA_PKGS_DIRS = Join-Path $env:RUNNER_TEMP red-mesa-pkgs
+          $manager = Join-Path $env:CONDA Scripts/conda.exe
+          & $manager create -y -p $prefix --override-channels -c conda-forge --strict-channel-priority 'mesa-llvmpipe=26.2.6=hca91ad9_0'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $package = Join-Path $env:CONDA_PKGS_DIRS mesa-llvmpipe-26.2.6-hca91ad9_0.conda
+          $sha = (Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -ne '804e4cda73d7f4e9e5353da832c09f045c3bc221fca6d7fb0da4a4ce8dd93f51') { throw "Unexpected official conda-forge archive hash $sha" }
+          $bin = Join-Path $prefix Library/bin
+          Copy-Item "$bin/opengl32.dll" "$bin/red-mesa-opengl32sw.dll"
+          $env:QT_OPENGL_DLL = "$bin/red-mesa-opengl32sw.dll"
+          $env:GALLIUM_DRIVER = 'llvmpipe'
+          $env:PATH = "$bin;$env:PATH"
+          Get-FileHash "$bin/opengl32.dll", "$bin/libgallium_wgl.dll"
+          Write-Host "Verified conda-forge package SHA256 $sha"
+          pwsh -NoProfile -File "$env:RUNNER_TEMP/test-gl.ps1"
+          exit $LASTEXITCODE
