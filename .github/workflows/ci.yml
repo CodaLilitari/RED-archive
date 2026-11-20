@@ -1,29 +1,104 @@
-name: Verify locked Windows test provider staging
-on:
+name: Windows native aggregate timing
+'on':
   push:
-    branches: ["ci/0.8.0-windows-display-probe"]
+    branches:
+    - ci/0.8.0-windows-display-probe
 permissions:
   contents: read
 jobs:
-  staging:
+  aggregate:
+    name: Exact frozen RED Windows native aggregate
     runs-on: windows-latest
-    timeout-minutes: 5
     steps:
-      - name: Download and verify before offline installation in runner temp
-        shell: pwsh
-        run: |
-          $prefix = Join-Path $env:RUNNER_TEMP red-mesa
-          $env:CONDA_PKGS_DIRS = Join-Path $env:RUNNER_TEMP red-mesa-pkgs
-          $manager = Join-Path $env:CONDA Scripts/conda.exe
-          $spec = 'mesa-llvmpipe=26.2.6=hca91ad9_0'
-          $options = @('create', '-y', '-p', $prefix, '--override-channels', '-c', 'conda-forge', '--strict-channel-priority')
-          & $manager @options --download-only $spec
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $archive = Join-Path $env:CONDA_PKGS_DIRS 'mesa-llvmpipe-26.2.6-hca91ad9_0.conda'
-          $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($digest -ne '804e4cda73d7f4e9e5353da832c09f045c3bc221fca6d7fb0da4a4ce8dd93f51') { throw "Unexpected Mesa package SHA-256 $digest" }
-          & $manager @options --offline $spec
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $bin = Join-Path $prefix Library/bin
-          Copy-Item (Join-Path $bin opengl32.dll) (Join-Path $bin red-mesa-opengl32sw.dll)
-          Get-FileHash "$bin/red-mesa-opengl32sw.dll", "$bin/libgallium_wgl.dll"
+    - uses: actions/checkout@v4
+      with:
+        ref: c1cc98f098425a57441df06e242cb219f2fd6993
+        persist-credentials: false
+    - name: Install Qt 6.8.3
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: 6.8.3
+        host: windows
+        target: desktop
+        arch: win64_msvc2022_64
+        modules: qtmultimedia
+    - name: Set up MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+    - name: Configure
+      run: cmake -S . -B build/full -G "Ninja Multi-Config" -DSED_CPP_STANDARD=23 -DSED_QT_ROOT="${{ env.QT_ROOT_DIR }}"
+    - name: Build
+      run: |-
+        $cores = [Environment]::ProcessorCount
+        $freeGiB = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
+        $jobs = [Math]::Max(1, [Math]::Min([Math]::Min(4, $cores), [int][Math]::Floor($freeGiB / 2.5)))
+        cmake --build build/full --config Release --target sed_app_main_window_tests --parallel $jobs
+    - name: Set and verify the hosted Windows test display
+      shell: pwsh
+      run: |
+        $helper = Join-Path $env:RUNNER_TEMP "red-windows-test-display.exe"
+        $object = Join-Path $env:RUNNER_TEMP "red-windows-test-display.obj"
+        cl.exe /nologo /EHsc /W4 /WX tools/ci/windows_test_display.cpp user32.lib "/Fo:$object" "/Fe:$helper"
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $helper --configure
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        & $helper --verify
+        exit $LASTEXITCODE
+    - name: Prepare a verified software OpenGL provider for Windows tests
+      shell: pwsh
+      run: |
+        $prefix = Join-Path $env:RUNNER_TEMP red-mesa
+        $env:CONDA_PKGS_DIRS = Join-Path $env:RUNNER_TEMP red-mesa-pkgs
+        $manager = Join-Path $env:CONDA Scripts/conda.exe
+        $spec = 'mesa-llvmpipe=26.2.6=hca91ad9_0'
+        $options = @('create', '-y', '-p', $prefix, '--override-channels', '-c', 'conda-forge', '--strict-channel-priority')
+        & $manager @options --download-only $spec
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        $archive = Join-Path $env:CONDA_PKGS_DIRS 'mesa-llvmpipe-26.2.6-hca91ad9_0.conda'
+        $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($digest -ne '804e4cda73d7f4e9e5353da832c09f045c3bc221fca6d7fb0da4a4ce8dd93f51') { throw "Unexpected Mesa package SHA-256 $digest" }
+        & $manager @options --offline $spec
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        $bin = Join-Path $prefix Library/bin
+        Copy-Item (Join-Path $bin opengl32.dll) (Join-Path $bin red-mesa-opengl32sw.dll)
+    - name: Run the sole registered aggregate with its full assertion set
+      timeout-minutes: 68
+      env:
+        QT_OPENGL: software
+        QT_QPA_PLATFORM_PLUGIN_PATH: ${{ env.QT_ROOT_DIR }}/plugins/platforms
+      shell: pwsh
+      run: |-
+        $bin = Join-Path $env:RUNNER_TEMP red-mesa/Library/bin
+        $env:QT_OPENGL_DLL = Join-Path $bin red-mesa-opengl32sw.dll
+        $env:GALLIUM_DRIVER = 'llvmpipe'
+        $env:PATH = "$bin;$env:PATH"
+        $filter = '^sed_app_main_window_tests$'
+        function Read-Aggregate {
+            $description = ctest --test-dir build/full -C Release -R $filter --show-only=json-v1 | ConvertFrom-Json
+            if ($LASTEXITCODE -or $description.tests.Count -ne 1) { throw "Expected exactly one CTest registration" }
+            $record = $description.tests[0]
+            if ($record.name -ne 'sed_app_main_window_tests' -or $record.command.Count -ne 1) { throw 'Expected unchanged argument-free aggregate executable' }
+            return ($record.properties | Where-Object name -eq TIMEOUT).value
+        }
+        $sourceHead = git rev-parse HEAD
+        if ($sourceHead -ne 'c1cc98f098425a57441df06e242cb219f2fd6993') { throw "Unexpected source SHA $sourceHead" }
+        $initial = Read-Aggregate
+        if ($initial -ne 1500) { throw "Expected maintained 1500-second timeout, got $initial" }
+        $generated = 'build/full/src/app/CTestTestfile.cmake'
+        Add-Content -LiteralPath $generated -Value 'set_tests_properties(sed_app_main_window_tests PROPERTIES TIMEOUT 3600)'
+        $override = Read-Aggregate
+        if ($override -ne 3600) { throw "Expected diagnostic 3600-second timeout, got $override" }
+        Write-Host "Frozen source $sourceHead; CTest timeout $initial -> $override seconds; one argument-free aggregate."
+        ctest --test-dir build/full -C Release -R $filter --output-on-failure --no-tests=error --parallel 1 --output-junit windows-ctest.xml
+    - name: Upload Windows test diagnostics
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: windows-test-diagnostics-native-aggregate-c1
+        path: |
+          build/full/Testing/Temporary/
+          build/full/windows-ctest.xml
+        if-no-files-found: warn
+        retention-days: 14
+    timeout-minutes: 130
