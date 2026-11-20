@@ -106,7 +106,7 @@ jobs:
           }
           '@ | Set-Content (Join-Path $env:RUNNER_TEMP probe.cpp) -Encoding utf8
           $includes = 'QtCore', 'QtGui', 'QtWidgets', 'QtOpenGL', 'QtOpenGLWidgets' | ForEach-Object { "/I$qt/include/$_" }
-          cl.exe /nologo /EHsc /MD /std:c++17 "/I$qt/include" @includes "$env:RUNNER_TEMP/probe.cpp" "/Fo:$env:RUNNER_TEMP/probe.obj" "/Fe:$env:RUNNER_TEMP/probe.exe" /link "/LIBPATH:$qt/lib" Qt6Core.lib Qt6Gui.lib Qt6Widgets.lib Qt6OpenGL.lib Qt6OpenGLWidgets.lib
+          cl.exe /nologo /EHsc /MD /std:c++17 /Zc:__cplusplus /permissive- "/I$qt/include" @includes "$env:RUNNER_TEMP/probe.cpp" "/Fo:$env:RUNNER_TEMP/probe.obj" "/Fe:$env:RUNNER_TEMP/probe.exe" /link "/LIBPATH:$qt/lib" Qt6Core.lib Qt6Gui.lib Qt6Widgets.lib Qt6OpenGL.lib Qt6OpenGLWidgets.lib
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           @'
           $PSNativeCommandUseErrorActionPreference = $false
