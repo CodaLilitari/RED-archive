@@ -1,20 +1,33 @@
-name: Windows display and input probe
+name: Windows native release qualification
 on:
   push:
     branches: ["ci/0.8.0-windows-display-probe"]
 permissions:
   contents: read
 jobs:
-  probe:
+  windows:
+    name: Complete frozen Windows release on native 1080p desktop
     runs-on: windows-latest
-    timeout-minutes: 5
+    timeout-minutes: 150
     steps:
-      - name: Read native input, enumerate modes and verify delivery
+      - uses: actions/checkout@v4
+        with:
+          ref: cb449b6820d37b245f5c8f8c7989c897e7ee5d79
+          persist-credentials: false
+      - name: Record and verify source revision
+        shell: pwsh
+        run: |
+          $revision = git rev-parse HEAD
+          Write-Host "Frozen RED source $revision"
+          if ($revision -ne 'cb449b6820d37b245f5c8f8c7989c897e7ee5d79') { throw 'Unexpected source revision' }
+      - name: Qualify native 1920×1080 on the hosted desktop
         shell: python {0}
         run: |
           import ctypes as c
           import json
           import os
+          import subprocess
+          import sys
           import time
           from ctypes import wintypes as w
 
@@ -93,7 +106,9 @@ jobs:
 
               root = tk.Tk()
               root.title("RED disposable hosted input probe")
-              root.geometry("320x180+70+80")
+              x = 1450 if label == "1920x1080" else 70
+              y = 710 if label == "1920x1080" else 80
+              root.geometry(f"320x180+{x}+{y}")
               results = []
               root.bind("<ButtonPress-1>", lambda e: results.append("press"))
               root.bind("<ButtonRelease-1>", lambda e: results.append("release"))
@@ -121,13 +136,32 @@ jobs:
                       mouse_event(2, 0, 0, 0, 0)
                       mouse_event(4, 0, 0, 0, 0)
                       pump()
+                  rect = w.RECT()
+                  work_ok = user.SystemParametersInfoW(0x30, 0, c.byref(rect), 0)
                   log("native-input", mode=label, target_created=bool(target), foreground_existed=bool(initial_fg),
                       set_foreground=accepted, foreground_matched=foreground_match,
                       cursor_set=moved, cursor_read=read, requested=[p.x, p.y], actual=[actual.x, actual.y],
                       hit_own_window=over_own, received=results,
-                      tk_dimensions=[root.winfo_screenwidth(), root.winfo_screenheight()])
+                      tk_dimensions=[root.winfo_screenwidth(), root.winfo_screenheight()],
+                      monitor_dimensions=[user.GetSystemMetrics(0), user.GetSystemMetrics(1)],
+                      work_area=[rect.left, rect.top, rect.right, rect.bottom] if work_ok else None)
+                  if label == "1920x1080":
+                      if not (target and foreground_match and moved and read and over_own
+                              and actual.x == p.x and actual.y == p.y and actual.x > 1024
+                              and results == ["press", "release"]
+                              and root.winfo_screenwidth() == 1920 and root.winfo_screenheight() == 1080):
+                          raise RuntimeError("The fresh 1920x1080 process could not qualify real foreground and pointer delivery")
               finally:
                   root.destroy()
+
+
+          if len(sys.argv) == 3 and sys.argv[1] == "child":
+              probe_window(sys.argv[2])
+              sys.exit(0)
+
+
+          def fresh_probe(label):
+              subprocess.run([sys.executable, os.path.abspath(__file__), "child", label], check=True)
 
 
           session = w.DWORD()
@@ -146,8 +180,9 @@ jobs:
               modes.append(m)
           log("display", current=dims(original) if original else None,
               modes=sorted(set(dims(m) for m in modes)))
-          probe_window("original")
+          fresh_probe("original")
           if original:
+              qualified = False
               try:
                   for width, height in ((1920,1080), (2560,1440)):
                       offered = [m for m in modes if m.width == width and m.height == height and m.bpp == original.bpp]
@@ -164,9 +199,60 @@ jobs:
                       log("mode-change", requested=[width,height], offered=True, cds_test=test, applied=applied,
                           actual=dims(current) if current else None)
                       if applied == 0 and current and (current.width,current.height) == (width,height):
-                          probe_window(str(width) + "x" + str(height))
+                          fresh_probe(str(width) + "x" + str(height))
+                          if (width,height) == (1920,1080):
+                              qualified = True
+                              break
               finally:
-                  original.fields = 0x40000 | 0x80000 | 0x100000 | 0x400000
-                  restored = change(None, c.byref(original), None, 0, None)
-                  current = mode(0xffffffff)
-                  log("restore", result=restored, actual=dims(current) if current else None)
+                  if not qualified:
+                      original.fields = 0x40000 | 0x80000 | 0x100000 | 0x400000
+                      restored = change(None, c.byref(original), None, 0, None)
+                      log("restore-after-failure", result=restored)
+              if not qualified:
+                  raise RuntimeError("1920x1080 was unavailable on this runner")
+          else:
+              raise RuntimeError("Could not read the runner display")
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtmultimedia
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure
+        run: cmake -S . -B build/full -G "Ninja Multi-Config" -DSED_CPP_STANDARD=23 -DSED_QT_ROOT="${{ env.QT_ROOT_DIR }}"
+      - name: Build
+        shell: pwsh
+        run: |
+          $cores = [Environment]::ProcessorCount
+          $availableGiB = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
+          $jobs = [Math]::Max(1, [Math]::Min([Math]::Min(4, $cores), [int][Math]::Floor($availableGiB / 2.5)))
+          Write-Host "Logical CPUs $cores; available memory $availableGiB GiB; parallel build jobs $jobs"
+          cmake --build build/full --config Release --parallel $jobs
+      - name: Complete Windows Release CTest gate
+        timeout-minutes: 75
+        env:
+          QT_OPENGL: software
+          QT_QPA_PLATFORM_PLUGIN_PATH: ${{ env.QT_ROOT_DIR }}/plugins/platforms
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          $screen = [Windows.Forms.Screen]::PrimaryScreen
+          Write-Host "Pre-CTest native screen $($screen.Bounds); work area $($screen.WorkingArea)"
+          if ($screen.Bounds.Width -ne 1920 -or $screen.Bounds.Height -ne 1080) { throw 'Native full-HD mode no longer active' }
+          ctest --test-dir build/full -C Release --output-on-failure --no-tests=error --parallel 1 --output-junit windows-ctest.xml
+      - name: Upload Windows test diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-test-diagnostics-native-1080p-cb449b68
+          path: |
+            build/full/Testing/Temporary/
+            build/full/windows-ctest.xml
+          if-no-files-found: warn
+          retention-days: 14
