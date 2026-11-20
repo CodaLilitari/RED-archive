@@ -1,98 +1,51 @@
-name: Focused macOS native qualification
-
+name: Cocoa anchor placement diagnostic
 on:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
-  cocoa:
+  anchor:
     if: github.ref == 'refs/heads/ci/0.8.0-macos-native-followup'
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 10
     env:
       QT_QPA_PLATFORM: cocoa
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          fetch-depth: 2
           persist-credentials: false
-      - name: Install Ninja
-        run: brew install ninja
-      - name: Install Qt
+      - name: Install Qt Widgets
         uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06
         with:
           version: '6.8.3'
           host: mac
           target: desktop
           arch: clang_64
-          modules: qtmultimedia
           aqtversion: ==3.3.0
           py7zrversion: ==1.1.0
-      - name: Prepare native desktop and shared renderer readback
+      - name: Build and compare native modal placement
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/cocoa"
+          mkdir -p "$RUNNER_TEMP/anchor" "$RUNNER_TEMP/cocoa"
           xcrun swift tools/release/prepare_macos_test_display.swift | tee "$RUNNER_TEMP/cocoa/display.log"
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("src/app/src/render/gl_view_render.cpp")
-          s = p.read_text()
-          anchor = "    QOpenGLContext* activeContext = QOpenGLContext::currentContext();"
-          assert s.count(anchor) == 1
-          diagnostic = """
-              static bool recorded = false;
-              if (activeContext && !recorded) {
-                  recorded = true;
-                  auto *gl = activeContext->extraFunctions();
-                  auto info = [gl](GLenum name) { return reinterpret_cast<const char*>(gl->glGetString(name)); };
-                  std::fprintf(stderr, "COCOA-CONTEXT: GL=%s; GLSL=%s; renderer=%s; vendor=%s\\n",
-                      info(GL_VERSION), info(GL_SHADING_LANGUAGE_VERSION), info(GL_RENDERER), info(GL_VENDOR));
-              }"""
-          p.write_text("#include <cstdio>\n" + s.replace(anchor, anchor + diagnostic))
-          PY
-      - name: Record anchor and frame geometry without changing placement
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("src/app/src/ui/components/dialog_window_policy.hpp")
-          s = p.read_text()
-          anchor = "    const QPoint measuredTopLeft = dialog.frameGeometry().topLeft();"
-          assert s.count(anchor) == 1
-          probe = """
-              std::fprintf(stderr, "CAPTION-BEFORE-SHOW anchor=%d,%d,%dx%d client=%dx%d requestedSize=%dx%d requestedPos=%d,%d frame=%d,%d,%dx%d available=%d,%d,%dx%d margins=%d,%d,%d,%d\\n",
-                  anchorGlobalRect.x(), anchorGlobalRect.y(), anchorGlobalRect.width(), anchorGlobalRect.height(),
-                  dialog.width(), dialog.height(), frameSize.width(), frameSize.height(), target.x(), target.y(),
-                  dialog.frameGeometry().x(), dialog.frameGeometry().y(), dialog.frameGeometry().width(), dialog.frameGeometry().height(),
-                  screen->availableGeometry().x(), screen->availableGeometry().y(), screen->availableGeometry().width(), screen->availableGeometry().height(),
-                  frameMargins.left(), frameMargins.top(), frameMargins.right(), frameMargins.bottom());"""
-          p.write_text("#include <cstdio>\n" + s.replace(anchor, anchor + probe))
-          p = Path("src/app/tests/parameter_helper_dialog_tests.cpp")
-          s = p.read_text()
-          anchor = "            const QRect dialogGlobal = dialog->frameGeometry();"
-          assert s.count(anchor) == 1
-          probe = """
-                      std::fprintf(stderr, "CAPTION-AFTER-SHOW anchor=%d,%d,%dx%d frame=%d,%d,%dx%d shownClient=%dx%d min=%d caption=%d\\n",
-                          anchorGlobal.x(), anchorGlobal.y(), anchorGlobal.width(), anchorGlobal.height(),
-                          dialogGlobal.x(), dialogGlobal.y(), dialogGlobal.width(), dialogGlobal.height(), dialog->width(), dialog->height(),
-                          dialog->minimumWidth(), ui::minimumDialogWidthForCaption(*dialog));"""
-          p.write_text("#include <cstdio>\n" + s.replace(anchor, anchor + probe))
-          PY
-      - name: Build the focused native test target
-        run: |
-          set -euo pipefail
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSED_CPP_STANDARD=23 \
-            -DSED_QT_ROOT="$QT_ROOT_DIR" -DSED_BUILD_UPDATE=OFF -DSED_BUILD_PLUGIN_BRIDGE=OFF \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
-          cmake --build build --parallel 3 --target sed_app_main_window_tests
-      - name: Verify cursor, shape and reactivated input-dialog layout
-        run: |
-          set -euo pipefail
-          ctest --test-dir build --output-on-failure --no-tests=error --parallel 1 \
-            -R '^sed_app_(cleave_(input_routing|fly_custom_shortcuts|uv_custom_owner|shape_apply)|parameter_helper_dialogs)$' \
-            --output-junit "$RUNNER_TEMP/cocoa/combined.xml" 2>&1 | tee "$RUNNER_TEMP/cocoa/combined.log"
-      - name: Preserve focused readback
+          cat > "$RUNNER_TEMP/anchor/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.21)
+          project(cocoa_anchor LANGUAGES CXX)
+          find_package(Qt6 REQUIRED COMPONENTS Widgets)
+          add_executable(cocoa-anchor "$ENV{GITHUB_WORKSPACE}/.github/diagnostics/cocoa_anchor.cpp")
+          target_compile_features(cocoa-anchor PRIVATE cxx_std_17)
+          target_include_directories(cocoa-anchor PRIVATE "$ENV{GITHUB_WORKSPACE}/src/app/src")
+          target_link_libraries(cocoa-anchor PRIVATE Qt6::Widgets)
+          CMAKE
+          cmake -S "$RUNNER_TEMP/anchor" -B "$RUNNER_TEMP/anchor/build" -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+          cmake --build "$RUNNER_TEMP/anchor/build" --parallel 2
+          for mode in hidden modal-hidden shown shown-synced queued modal-queued; do
+            for side in right left; do
+              "$RUNNER_TEMP/anchor/build/cocoa-anchor" "$mode" "$side" > "$RUNNER_TEMP/cocoa/$mode-$side.log" 2>&1 || true
+              grep '^RESULT ' "$RUNNER_TEMP/cocoa/$mode-$side.log"
+            done
+          done
+      - name: Preserve native placement readback
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
