@@ -1,160 +1,29 @@
-name: Windows native OpenGL 3.3 qualification
+name: Verify locked Windows test provider staging
 on:
   push:
     branches: ["ci/0.8.0-windows-display-probe"]
 permissions:
   contents: read
 jobs:
-  gl:
+  staging:
     runs-on: windows-latest
-    timeout-minutes: 18
-    env:
-      QT_OPENGL: software
-      QT_FORCE_STDERR_LOGGING: "1"
-      QT_LOGGING_RULES: qt.qpa.gl.debug=true
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: cb449b6820d37b245f5c8f8c7989c897e7ee5d79
-          persist-credentials: false
-      - uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.8.3"
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          modules: qtmultimedia
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-      - name: Build frozen RED native depth fixture and independent context probe
-        shell: pwsh
-        run: |
-          $qt = $env:QT_ROOT_DIR
-          git rev-parse HEAD
-          cmake -S . -B build/gl -G "Ninja Multi-Config" -DSED_CPP_STANDARD=23 "-DSED_QT_ROOT=$qt"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build build/gl --config Release --target sed_app_depth_snapshot_tests --parallel 2
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          @'
-          #define NOMINMAX
-          #include <windows.h>
-          #include <tlhelp32.h>
-          #include <QApplication>
-          #include <QOpenGLContext>
-          #include <QOpenGLFunctions>
-          #include <QOpenGLFunctions_3_3_Core>
-          #include <QOpenGLVersionFunctionsFactory>
-          #include <QOpenGLWidget>
-          #include <QThread>
-          #include <QElapsedTimer>
-          #include <cstdio>
-          #include <string>
-
-          void modules() {
-              HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-              MODULEENTRY32W m{};
-              m.dwSize = sizeof(m);
-              if (snapshot != INVALID_HANDLE_VALUE && Module32FirstW(snapshot, &m)) {
-                  do {
-                      const QString name = QString::fromWCharArray(m.szModule).toLower();
-                      if (name.contains("opengl") || name.contains("gallium") || name.contains("llvm")) {
-                          std::printf("Loaded module %s\n", QString::fromWCharArray(m.szExePath).toUtf8().constData());
-                      }
-                  } while (Module32NextW(snapshot, &m));
-              }
-              if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot);
-          }
-
-          int main(int argc, char** argv) {
-              const bool compatibility = argc >= 2 && std::string(argv[1]) == "--compat";
-              QSurfaceFormat requested;
-              requested.setVersion(compatibility ? 2 : 3, compatibility ? 0 : 3);
-              requested.setProfile(compatibility ? QSurfaceFormat::NoProfile : QSurfaceFormat::CoreProfile);
-              requested.setDepthBufferSize(24);
-              requested.setStencilBufferSize(8);
-              QSurfaceFormat::setDefaultFormat(requested);
-              QApplication app(argc, argv);
-              QOpenGLWidget widget;
-              widget.resize(320, 240);
-              widget.show();
-              QElapsedTimer wait;
-              wait.start();
-              do {
-                  app.processEvents();
-                  QThread::msleep(10);
-              } while (!widget.isValid() && wait.elapsed() < 4000);
-              std::printf("Qt %s requested %s; widget valid %d\n", qVersion(),
-                  compatibility ? "2.0" : "3.3 core, depth 24 stencil 8", int(widget.isValid()));
-              modules();
-              if (!widget.isValid() || !widget.context()) return 2;
-              widget.makeCurrent();
-              auto* context = widget.context();
-              const auto fmt = context->format();
-              auto* f = context->functions();
-              std::printf("Actual Qt format %d.%d profile %d depth %d stencil %d\n",
-                  fmt.majorVersion(), fmt.minorVersion(), int(fmt.profile()), fmt.depthBufferSize(), fmt.stencilBufferSize());
-              for (const auto key : { GL_VENDOR, GL_RENDERER, GL_VERSION, GL_SHADING_LANGUAGE_VERSION }) {
-                  const auto* value = f->glGetString(key);
-                  std::printf("GL %04x %s\n", key, value ? reinterpret_cast<const char*>(value) : "(null)");
-              }
-              auto* core = QOpenGLVersionFunctionsFactory::get<QOpenGLFunctions_3_3_Core>(context);
-              const bool coreWorks = core && core->initializeOpenGLFunctions();
-              const auto error = f->glGetError();
-              std::printf("3.3 core functions %d; GL error %04x\n", int(coreWorks), error);
-              return compatibility || (coreWorks && !error) ? 0 : 3;
-          }
-          '@ | Set-Content (Join-Path $env:RUNNER_TEMP probe.cpp) -Encoding utf8
-          $includes = 'QtCore', 'QtGui', 'QtWidgets', 'QtOpenGL', 'QtOpenGLWidgets' | ForEach-Object { "/I$qt/include/$_" }
-          cl.exe /nologo /EHsc /MD /std:c++17 /Zc:__cplusplus /permissive- "/I$qt/include" @includes "$env:RUNNER_TEMP/probe.cpp" "/Fo:$env:RUNNER_TEMP/probe.obj" "/Fe:$env:RUNNER_TEMP/probe.exe" /link "/LIBPATH:$qt/lib" Qt6Core.lib Qt6Gui.lib Qt6Widgets.lib Qt6OpenGL.lib Qt6OpenGLWidgets.lib
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          @'
-          $PSNativeCommandUseErrorActionPreference = $false
-          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT_DIR/plugins/platforms"
-          & "$env:RUNNER_TEMP/probe.exe" --compat
-          Write-Host "Compatibility-return=$LASTEXITCODE"
-          & "$env:RUNNER_TEMP/probe.exe"
-          $core = $LASTEXITCODE
-          ctest --test-dir build/gl -C Release -R '^sed_app_depth_snapshot$' --output-on-failure --no-tests=error
-          $depth = $LASTEXITCODE
-          Write-Host "Native-core-return=$core RED-depth-return=$depth"
-          if ($core -eq 0 -and $depth -eq 0) { exit 0 }
-          exit 1
-          '@ | Set-Content "$env:RUNNER_TEMP/test-gl.ps1" -Encoding utf8
-      - name: Test Qt stock loader and absolute kit path in fresh processes
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
-          $kit = "$env:QT_ROOT_DIR/bin/opengl32sw.dll"
-          Get-FileHash $kit
-          Write-Host "Stock software loader"
-          pwsh -NoProfile -File "$env:RUNNER_TEMP/test-gl.ps1"
-          $bare = $LASTEXITCODE
-          $env:QT_OPENGL_DLL = $kit
-          Write-Host "Stock explicit library $kit"
-          pwsh -NoProfile -File "$env:RUNNER_TEMP/test-gl.ps1"
-          $absolute = $LASTEXITCODE
-          Write-Host "Bare return $bare. Absolute return $absolute."
-          if ($bare -eq 0 -or $absolute -eq 0) { "RED_STOCK_PASSED=1" >> $env:GITHUB_ENV }
-          exit 0
-      - name: Test pinned conda-forge Mesa llvmpipe in an isolated prefix
-        if: env.RED_STOCK_PASSED != '1'
+      - name: Download and verify before offline installation in runner temp
         shell: pwsh
         run: |
           $prefix = Join-Path $env:RUNNER_TEMP red-mesa
           $env:CONDA_PKGS_DIRS = Join-Path $env:RUNNER_TEMP red-mesa-pkgs
           $manager = Join-Path $env:CONDA Scripts/conda.exe
-          & $manager create -y -p $prefix --override-channels -c conda-forge --strict-channel-priority 'mesa-llvmpipe=26.2.6=hca91ad9_0'
+          $spec = 'mesa-llvmpipe=26.2.6=hca91ad9_0'
+          $options = @('create', '-y', '-p', $prefix, '--override-channels', '-c', 'conda-forge', '--strict-channel-priority')
+          & $manager @options --download-only $spec
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $package = Join-Path $env:CONDA_PKGS_DIRS mesa-llvmpipe-26.2.6-hca91ad9_0.conda
-          $sha = (Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($sha -ne '804e4cda73d7f4e9e5353da832c09f045c3bc221fca6d7fb0da4a4ce8dd93f51') { throw "Unexpected official conda-forge archive hash $sha" }
+          $archive = Join-Path $env:CONDA_PKGS_DIRS 'mesa-llvmpipe-26.2.6-hca91ad9_0.conda'
+          $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne '804e4cda73d7f4e9e5353da832c09f045c3bc221fca6d7fb0da4a4ce8dd93f51') { throw "Unexpected Mesa package SHA-256 $digest" }
+          & $manager @options --offline $spec
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $bin = Join-Path $prefix Library/bin
-          Copy-Item "$bin/opengl32.dll" "$bin/red-mesa-opengl32sw.dll"
-          $env:QT_OPENGL_DLL = "$bin/red-mesa-opengl32sw.dll"
-          $env:GALLIUM_DRIVER = 'llvmpipe'
-          $env:PATH = "$bin;$env:PATH"
-          Get-FileHash "$bin/opengl32.dll", "$bin/libgallium_wgl.dll"
-          Write-Host "Verified conda-forge package SHA256 $sha"
-          pwsh -NoProfile -File "$env:RUNNER_TEMP/test-gl.ps1"
-          exit $LASTEXITCODE
+          Copy-Item (Join-Path $bin opengl32.dll) (Join-Path $bin red-mesa-opengl32sw.dll)
+          Get-FileHash "$bin/red-mesa-opengl32sw.dll", "$bin/libgallium_wgl.dll"
